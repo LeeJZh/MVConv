@@ -14,11 +14,14 @@ from argparse import ArgumentParser, Namespace
 from collections import OrderedDict
 
 import torch
+from torch import nn
+from torch.nn import parameter
 import torch.nn.functional as F
 from torch.nn.modules import padding
 import torch.nn.parallel
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils import data
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
@@ -27,14 +30,17 @@ import torchvision.transforms as transforms
 
 import pytorch_lightning as pl
 from pytorch_lightning.core import LightningModule
-import pprint
+
+import cifar_models
+
+# PROJECTION_RATIO = 3
 
 
 class MVConv(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 bias) -> None:
+                 bias, PROJECTION_RATIO) -> None:
         super().__init__()
-        projected_channels = max(8, in_channels // 3 + 1)
+        projected_channels = max(8, in_channels // PROJECTION_RATIO)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -73,11 +79,14 @@ class MVConv(torch.nn.Module):
                                           stride,
                                           padding,
                                           bias=bias)
+        self.main_bn = nn.BatchNorm2d(out_channels)
+        self.left_bn = nn.BatchNorm2d(out_channels)
+        self.right_bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
-        return self.main_conv(x) + self.left_conv(
-            self.left_projection(x)) + self.right_conv(
-                self.right_projection(x))
+        return self.main_bn(self.main_conv(x)) + self.left_bn(
+            self.left_conv(self.left_projection(x))) + self.right_bn(
+                self.right_conv(self.right_projection(x)))
 
     @staticmethod
     def merge_side(curr: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
@@ -87,6 +96,39 @@ class MVConv(torch.nn.Module):
             merged = torch.matmul(curr_t, prev_t)
             return merged.permute([2, 3, 0, 1])
 
+    @staticmethod
+    def fuse_kernel(conv: nn.Conv2d, bn: nn.BatchNorm2d):
+        with torch.no_grad():
+            conv_weight = conv.weight
+            conv_bias = conv.bias
+            bn_gamma = bn.weight
+            bn_beta = bn.bias
+            bn_std = bn.running_var
+            bn_mean = bn.running_mean
+            bn_eps = bn.eps
+            if conv_bias is not None:
+                bn_mean = bn_mean - conv_bias
+                bn_mean = bn_mean.view(-1, 1, 1, 1)
+            else:
+                bn_mean = bn_mean.view(-1, 1, 1, 1)
+            if bn_std is not None:
+                bn_std = bn_std + bn_eps
+            else:
+                bn_std = bn_eps
+            if bn_gamma is not None:
+                bn_gamma = bn_gamma.view(-1, 1, 1, 1)
+            else:
+                bn_gamma = torch.ones_like(bn_std)
+            if bn_beta is not None:
+                bn_beta = bn_beta.view(-1, 1, 1, 1)
+            else:
+                bn_beta = torch.zeros_like(bn_mean)
+            weight = conv_weight * bn_gamma / bn_std
+            bias = bn_beta - bn_gamma * bn_mean / bn_std
+            bias = bias.view(-1)
+
+        return weight, bias
+
     def deploy(self):
         with torch.no_grad():
             deploy_conv = torch.nn.Conv2d(self.in_channels,
@@ -94,14 +136,17 @@ class MVConv(torch.nn.Module):
                                           self.kernel_size,
                                           self.stride,
                                           self.padding,
-                                          bias=self.bias)
-            deploy_conv.weight = self.main_conv.weight
-            deploy_conv.weight += self.merge_side(self.left_conv.weight,
-                                                  self.left_projection.weight)
-            deploy_conv.weight += self.merge_side(self.right_conv.weight,
-                                                  self.right_projection.weight)
-            if self.bias is True:
-                deploy_conv.bias = self.main_conv.bias + self.left_conv.bias + self.right_conv.bias
+                                          bias=True)
+            fused_main_weight, fused_main_bias = self.fuse_kernel(
+                self.main_conv, self.main_bn),
+            fused_left_weight, fused_left_bias = self.fuse_kernel(
+                self.left_conv, self.left_bn),
+            fused_right_weght, fused_right_bias = self.fuse_kernel(
+                self.right_conv, self.right_bn)
+
+            deploy_conv.weight = fused_main_weight + fused_left_weight + fused_right_weght
+            deploy_conv.bias = fused_main_bias + fused_left_bias + fused_right_bias
+
         return deploy_conv
 
 
@@ -116,7 +161,7 @@ def make_it_deploy(m: torch.nn.Module):
             inplace_module_modification(child)
 
 
-def inplace_module_modification(m: torch.nn.Module):
+def inplace_module_modification(m: torch.nn.Module, project_ratio: float):
     for name, child in m.named_children():
         if isinstance(child, torch.nn.Conv2d) and child.kernel_size[0] == 3:
             # print("replace {} with mvconv".format(name))
@@ -128,7 +173,9 @@ def inplace_module_modification(m: torch.nn.Module):
                        child.kernel_size,
                        child.stride,
                        child.padding,
-                       bias=child.bias is not None))
+                       bias=child.bias is not None,
+                       PROJECTION_RATIO=project_ratio))
+            setattr(m, name.replace('conv', 'bn'), nn.Identity())
             # print(getattr(m, name))
         else:
             inplace_module_modification(child)
@@ -152,6 +199,7 @@ class ImageNetLightningModel(LightningModule):
         batch_size: int,
         workers: int,
         block: str,
+        project_ratio: float,
         **kwargs,
     ):
         super().__init__()
@@ -164,18 +212,21 @@ class ImageNetLightningModel(LightningModule):
         self.data_path = data_path
         self.batch_size = batch_size
         self.workers = workers
-        model = models.__dict__[self.arch](pretrained=self.pretrained)
+        # model = models.__dict__[self.arch](pretrained=self.pretrained)
+        model = getattr(cifar_models, arch.lower())(num_classes=10)
         self.block = block
+        self.project_ratio = project_ratio
         if self.block != "base":
-            inplace_module_modification(model)
+            inplace_module_modification(model,
+                                        project_ratio=self.project_ratio)
         self.model = model
-        self.example_input_array = torch.randn((1, 3, 224, 224))
-        # print(self.hparams)
+        self.example_input_array = torch.zeros((1, 3, 32, 32))
+        print(self.hparams)
 
-        # total_devices = self.hparams.gpus * self.hparams.num_nodes
-        # train_batches = len(self.train_dataloader()) // total_devices
-        # self.train_steps = (self.hparams.max_epochs * train_batches
-        #                     ) // self.hparams.accumulate_grad_batches
+        total_devices = self.hparams.gpus * self.hparams.num_nodes
+        train_batches = len(self.train_dataloader()) // total_devices
+        self.train_steps = (self.hparams.max_epochs * train_batches
+                            ) // self.hparams.accumulate_grad_batches
 
     def forward(self, x):
         return self.model(x)
@@ -187,9 +238,27 @@ class ImageNetLightningModel(LightningModule):
         acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
 
         result = pl.TrainResult(minimize=loss)
-        result.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        result.log('train_acc1', acc1, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        result.log('train_acc5', acc5, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        result.log('train_loss',
+                   loss,
+                   on_step=True,
+                   on_epoch=True,
+                   prog_bar=True,
+                   logger=True,
+                   sync_dist=True)
+        result.log('train_acc1',
+                   acc1,
+                   on_step=True,
+                   on_epoch=True,
+                   prog_bar=True,
+                   logger=True,
+                   sync_dist=True)
+        result.log('train_acc5',
+                   acc5,
+                   on_step=True,
+                   on_epoch=True,
+                   prog_bar=False,
+                   logger=True,
+                   sync_dist=True)
 
         return result
 
@@ -199,10 +268,28 @@ class ImageNetLightningModel(LightningModule):
         loss = F.cross_entropy(output, target)
         acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
 
-        result = pl.EvalResult(checkpoint_on=loss, early_stop_on=loss)
-        result.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        result.log('val_acc1', acc1, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        result.log('val_acc5', acc5, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        result = pl.EvalResult(checkpoint_on=acc1, early_stop_on=acc1)
+        result.log('val_loss',
+                   loss,
+                   on_step=False,
+                   on_epoch=True,
+                   prog_bar=True,
+                   logger=True,
+                   sync_dist=True)
+        result.log('val_acc1',
+                   acc1,
+                   on_step=False,
+                   on_epoch=True,
+                   prog_bar=True,
+                   logger=True,
+                   sync_dist=True)
+        result.log('val_acc5',
+                   acc5,
+                   on_step=False,
+                   on_epoch=True,
+                   prog_bar=False,
+                   logger=True,
+                   sync_dist=True)
 
         return result
 
@@ -230,32 +317,34 @@ class ImageNetLightningModel(LightningModule):
                               weight_decay=self.weight_decay)
         scheduler = lr_scheduler.LambdaLR(optimizer,
                                           lambda epoch: 0.1**(epoch // 30))
-        # scheduler = lr_scheduler.CosineAnnealingLR(optimizer,
-        #                                            T_max=self.train_steps)
-        # scheduler = {
-        #     'scheduler': scheduler,
-        #     'interval': 'step',  # or 'epoch'
-        #     'frequency': 1
-        # }
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer,
+                                                   T_max=self.train_steps)
+        scheduler = {
+            'scheduler': scheduler,
+            'interval': 'step',  # or 'epoch'
+            'frequency': 1
+        }
         return [optimizer], [scheduler]
 
     def train_dataloader(self):
         normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
+            (0.4914, 0.4822, 0.4465),
+            (0.2023, 0.1994, 0.2010),
         )
 
-        train_dir = os.path.join(self.data_path, 'train')
-        # self.print("building training set")
-        train_dataset = datasets.ImageFolder(
-            train_dir,
-            transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]))
-        # self.print("training set done")
+        print("building training set")
+        train_dataset = datasets.CIFAR10(self.data_path,
+                                         train=True,
+                                         download=True,
+                                         transform=transforms.Compose([
+                                             transforms.RandomCrop(
+                                                 32,
+                                                 padding=4,
+                                                 padding_mode='reflect'),
+                                             transforms.RandomHorizontalFlip(),
+                                             transforms.ToTensor(), normalize
+                                         ]))
+        print("training set done")
         train_loader = torch.utils.data.DataLoader(
             dataset=train_dataset,
             batch_size=self.batch_size,
@@ -266,25 +355,23 @@ class ImageNetLightningModel(LightningModule):
 
     def val_dataloader(self):
         normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
+            (0.4914, 0.4822, 0.4465),
+            (0.2023, 0.1994, 0.2010),
         )
-        val_dir = os.path.join(self.data_path, 'val')
-        # self.print("building validation dataset")
+        print("building validation dataset")
         val_loader = torch.utils.data.DataLoader(
-            datasets.ImageFolder(
-                val_dir,
-                transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    normalize,
-                ])),
+            datasets.CIFAR10(self.data_path,
+                             train=False,
+                             download=True,
+                             transform=transforms.Compose([
+                                 transforms.ToTensor(),
+                                 normalize,
+                             ])),
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.workers,
         )
-        # self.print("validation set done")
+        print("validation set done")
         return val_loader
 
     def test_dataloader(self):
@@ -300,7 +387,7 @@ class ImageNetLightningModel(LightningModule):
             '-a',
             '--arch',
             metavar='ARCH',
-            default='resnet18',
+            default='resnet56',
             choices=ImageNetLightningModel.MODEL_NAMES,
             help=('model architecture: ' +
                   ' | '.join(ImageNetLightningModel.MODEL_NAMES) +
@@ -348,6 +435,10 @@ class ImageNetLightningModel(LightningModule):
                             default='base',
                             type=str,
                             metavar='BK')
+        parser.add_argument('--project-ratio',
+                            default=3.0,
+                            type=float,
+                            dest='project_ratio')
         return parser
 
 
@@ -362,11 +453,16 @@ def main(args: Namespace) -> None:
         args.batch_size = int(args.batch_size / max(1, args.gpus))
         args.workers = int(args.workers / max(1, args.gpus))
     # print(**vars(args))
-    # pprint.pprint(args)
+    # print(args)
     model = ImageNetLightningModel(**vars(args))
     trainer = pl.Trainer.from_argparse_args(args)
 
     if args.evaluate:
+        try:
+            model = model.load_from_checkpoint(args.ckpt)
+        except Exception as excep:
+            print(excep)
+        make_it_deploy(model)
         trainer.test(model)
     else:
         trainer.fit(model)
@@ -376,7 +472,7 @@ def run_cli():
     parent_parser = ArgumentParser(add_help=False)
     parent_parser = pl.Trainer.add_argparse_args(parent_parser)
     parent_parser.add_argument('--data-path',
-                               default="/workspace/cpfs-data/ImageNet",
+                               default="/workspace/cpfs-data/cifar10",
                                metavar='DIR',
                                type=str,
                                help='path to dataset')
@@ -389,11 +485,12 @@ def run_cli():
                                type=int,
                                default=42,
                                help='seed for initializing training.')
+    parent_parser.add_argument('--ckpt', type=str, default='')
     parser = ImageNetLightningModel.add_model_specific_args(parent_parser)
     parser.set_defaults(
         profiler=True,
         deterministic=True,
-        max_epochs=90,
+        max_epochs=400,
     )
     args = parser.parse_args()
     main(args)
