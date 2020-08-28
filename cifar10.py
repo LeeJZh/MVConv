@@ -40,7 +40,16 @@ class MVConv(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
                  bias, PROJECTION_RATIO) -> None:
         super().__init__()
-        projected_channels = max(8, in_channels // PROJECTION_RATIO)
+        # projected_channels = max(8, int(in_channels // PROJECTION_RATIO))
+
+        if in_channels // PROJECTION_RATIO < 8:
+            projected_channels = in_channels
+        else:
+            projected_channels = in_channels // PROJECTION_RATIO
+
+        # projected_channels = in_channels // PROJECTION_RATIO
+        # projected_channels = in_channels if projected_channels < 8 else projected_channels
+        projected_channels = int(projected_channels)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -80,8 +89,11 @@ class MVConv(torch.nn.Module):
                                           padding,
                                           bias=bias)
         self.main_bn = nn.BatchNorm2d(out_channels)
+        nn.init.constant_(self.main_bn.weight, 0.3333)
         self.left_bn = nn.BatchNorm2d(out_channels)
+        nn.init.constant_(self.left_bn.weight, 0.3333)
         self.right_bn = nn.BatchNorm2d(out_channels)
+        nn.init.constant_(self.right_bn.weight, 0.3333)
 
     def forward(self, x):
         return self.main_bn(self.main_conv(x)) + self.left_bn(
@@ -178,7 +190,7 @@ def inplace_module_modification(m: torch.nn.Module, project_ratio: float):
             setattr(m, name.replace('conv', 'bn'), nn.Identity())
             # print(getattr(m, name))
         else:
-            inplace_module_modification(child)
+            inplace_module_modification(child, project_ratio)
 
 
 class ImageNetLightningModel(LightningModule):
@@ -218,10 +230,9 @@ class ImageNetLightningModel(LightningModule):
         self.project_ratio = project_ratio
         if self.block != "base":
             inplace_module_modification(model,
-                                        project_ratio=self.project_ratio)
+                                        project_ratio=project_ratio)
         self.model = model
         self.example_input_array = torch.zeros((1, 3, 32, 32))
-        print(self.hparams)
 
         total_devices = self.hparams.gpus * self.hparams.num_nodes
         train_batches = len(self.train_dataloader()) // total_devices
@@ -235,30 +246,24 @@ class ImageNetLightningModel(LightningModule):
         images, target = batch
         output = self(images)
         loss = F.cross_entropy(output, target)
-        acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
+        acc1, = self.__accuracy(output, target, topk=(1, ))
 
         result = pl.TrainResult(minimize=loss)
         result.log('train_loss',
                    loss,
                    on_step=True,
                    on_epoch=True,
-                   prog_bar=True,
+                   prog_bar=False,
                    logger=True,
                    sync_dist=True)
         result.log('train_acc1',
                    acc1,
                    on_step=True,
                    on_epoch=True,
-                   prog_bar=True,
-                   logger=True,
-                   sync_dist=True)
-        result.log('train_acc5',
-                   acc5,
-                   on_step=True,
-                   on_epoch=True,
                    prog_bar=False,
                    logger=True,
                    sync_dist=True)
+        # result.log('lr', self.trainer.optimizer)
 
         return result
 
@@ -266,26 +271,19 @@ class ImageNetLightningModel(LightningModule):
         images, target = batch
         output = self(images)
         loss = F.cross_entropy(output, target)
-        acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
+        acc1, = self.__accuracy(output, target, topk=(1,))
 
-        result = pl.EvalResult(checkpoint_on=acc1, early_stop_on=acc1)
+        result = pl.EvalResult(checkpoint_on=loss)
         result.log('val_loss',
                    loss,
-                   on_step=False,
+                   on_step=True,
                    on_epoch=True,
-                   prog_bar=True,
+                   prog_bar=False,
                    logger=True,
                    sync_dist=True)
         result.log('val_acc1',
                    acc1,
-                   on_step=False,
-                   on_epoch=True,
-                   prog_bar=True,
-                   logger=True,
-                   sync_dist=True)
-        result.log('val_acc5',
-                   acc5,
-                   on_step=False,
+                   on_step=True,
                    on_epoch=True,
                    prog_bar=False,
                    logger=True,
@@ -315,8 +313,8 @@ class ImageNetLightningModel(LightningModule):
                               lr=self.lr,
                               momentum=self.momentum,
                               weight_decay=self.weight_decay)
-        scheduler = lr_scheduler.LambdaLR(optimizer,
-                                          lambda epoch: 0.1**(epoch // 30))
+        # scheduler = lr_scheduler.LambdaLR(optimizer,
+        #                                   lambda epoch: 0.1**(epoch // 30))
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer,
                                                    T_max=self.train_steps)
         scheduler = {
@@ -332,19 +330,17 @@ class ImageNetLightningModel(LightningModule):
             (0.2023, 0.1994, 0.2010),
         )
 
-        print("building training set")
         train_dataset = datasets.CIFAR10(self.data_path,
                                          train=True,
                                          download=True,
                                          transform=transforms.Compose([
                                              transforms.RandomCrop(
                                                  32,
-                                                 padding=4,
-                                                 padding_mode='reflect'),
+                                                 padding=4),
                                              transforms.RandomHorizontalFlip(),
-                                             transforms.ToTensor(), normalize
+                                             transforms.ToTensor(), 
+                                             normalize
                                          ]))
-        print("training set done")
         train_loader = torch.utils.data.DataLoader(
             dataset=train_dataset,
             batch_size=self.batch_size,
@@ -358,7 +354,6 @@ class ImageNetLightningModel(LightningModule):
             (0.4914, 0.4822, 0.4465),
             (0.2023, 0.1994, 0.2010),
         )
-        print("building validation dataset")
         val_loader = torch.utils.data.DataLoader(
             datasets.CIFAR10(self.data_path,
                              train=False,
@@ -371,7 +366,6 @@ class ImageNetLightningModel(LightningModule):
             shuffle=False,
             num_workers=self.workers,
         )
-        print("validation set done")
         return val_loader
 
     def test_dataloader(self):
@@ -401,7 +395,7 @@ class ImageNetLightningModel(LightningModule):
         parser.add_argument(
             '-b',
             '--batch-size',
-            default=256,
+            default=128,
             type=int,
             metavar='N',
             help='mini-batch size (default: 256), this is the total '
@@ -446,12 +440,12 @@ def main(args: Namespace) -> None:
     if args.seed is not None:
         pl.seed_everything(args.seed)
 
-    if args.distributed_backend == 'ddp':
+    # if args.distributed_backend == 'ddp':
         # When using a single GPU per process and per
         # DistributedDataParallel, we need to divide the batch size
         # ourselves based on the total number of GPUs we have
-        args.batch_size = int(args.batch_size / max(1, args.gpus))
-        args.workers = int(args.workers / max(1, args.gpus))
+    #     args.batch_size = int(args.batch_size / max(1, args.gpus))
+    #     args.workers = int(args.workers / max(1, args.gpus))
     # print(**vars(args))
     # print(args)
     model = ImageNetLightningModel(**vars(args))
@@ -466,6 +460,7 @@ def main(args: Namespace) -> None:
         trainer.test(model)
     else:
         trainer.fit(model)
+        trainer.save_checkpoint("final.ckpt")
 
 
 def run_cli():
@@ -483,7 +478,7 @@ def run_cli():
                                help='evaluate model on validation set')
     parent_parser.add_argument('--seed',
                                type=int,
-                               default=42,
+                               default=666,
                                help='seed for initializing training.')
     parent_parser.add_argument('--ckpt', type=str, default='')
     parser = ImageNetLightningModel.add_model_specific_args(parent_parser)
